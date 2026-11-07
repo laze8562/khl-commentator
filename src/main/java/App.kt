@@ -49,10 +49,10 @@ import java.util.concurrent.TimeUnit
 object Cfg {
     const val BANNER_X = 0.28      // левый край
     const val BANNER_W = 0.57      // ширина
-    const val BANNER_Y = 0.80      // верхний край
+    const val BANNER_Y = 0.72      // верхний край
     const val BOARD_X = 0.09       // табло сверху: левый край
-    const val BOARD_W = 0.52       // ширина
-    const val BOARD_H = 0.085      // высота
+    const val BOARD_W = 0.53       // ширина
+    const val BOARD_H = 0.075      // высота
     const val INTERVAL_MS = 700L   // как часто читать экран
     const val COOLDOWN_MS = 20000L // не повторять одно событие чаще
 }
@@ -228,35 +228,117 @@ class CaptureService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun analyze(bmp: Bitmap) {
-        val t = tess ?: return
+    // ---------- Распознавание ----------
+    // Игра рисует текст на пёстром фоне, поэтому перед чтением оставляем только
+    // нужный цвет (белый, синий или оранжевый), всё остальное заливаем белым.
+    private fun mask(src: Bitmap, scale: Int, pred: (Int, Int, Int) -> Boolean): Bitmap {
+        val w = src.width
+        val h = src.height
+        val px = IntArray(w * h)
+        src.getPixels(px, 0, w, 0, 0, w, h)
+        for (i in px.indices) {
+            val c = px[i]
+            px[i] = if (pred((c shr 16) and 255, (c shr 8) and 255, c and 255)) -0x1000000 else -1
+        }
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        out.setPixels(px, 0, w, 0, 0, w, h)
+        if (scale <= 1) return out
+        val big = Bitmap.createScaledBitmap(out, w * scale, h * scale, true)
+        out.recycle()
+        return big
+    }
+
+    private fun ocr(bmp: Bitmap, line: Boolean): String {
+        val t = tess ?: return ""
+        t.setPageSegMode(
+            if (line) TessBaseAPI.PageSegMode.PSM_SINGLE_LINE else TessBaseAPI.PageSegMode.PSM_SINGLE_BLOCK
+        )
         t.setImage(bmp)
-        val text = t.getUTF8Text() ?: ""
+        val s = t.getUTF8Text() ?: ""
         bmp.recycle()
-        val lines = text.lines().map { it.trim() }.filter { it.length > 1 }
+        return s
+    }
 
-        val shown = lines.joinToString(" | ").take(200)
-        if (shown != lastShown) {
-            lastShown = shown
-            showNotification(if (shown.isEmpty()) "Плашки нет" else "Вижу: $shown")
+    private val nameRe = Regex("[A-Za-z]{3,}")
+    private val goodNameRe = Regex("^[A-Z][a-z]{2,}(\\s+[A-Z][a-z]{2,}){1,2}$")
+    private val penWhiteRe = Regex("[МM][ИMUNH][НHN]\\s*[-–—]")
+    private var evKind = ""
+    private var evSeen = 0
+    private var evMiss = 0
+    private var evName = ""
+    private var evScore = -1
+    private var evAssist = ""
+    private var evReason = ""
+    private var dbgBanner = ""
+    private var dbgBoard = ""
+
+    private fun resetEvent() {
+        evKind = ""; evSeen = 0; evName = ""; evScore = -1; evAssist = ""; evReason = ""
+    }
+
+    private fun refreshNote() {
+        showNotification("Плашка: $dbgBanner\nТабло: $dbgBoard")
+    }
+
+    private fun analyze(crop: Bitmap) {
+        val navy = ocr(mask(crop, 1) { r, g, b -> b > 90 && r < 90 && b - r > 50 && b > g }, false).uppercase()
+        var kind = when {
+            goalRe.containsMatchIn(navy) -> "goal"
+            penRe.containsMatchIn(navy) -> "pen"
+            else -> ""
+        }
+        var white = ""
+        if (kind.isNotEmpty() || tick % 2 == 0) {
+            white = ocr(mask(crop, 1) { r, g, b -> minOf(r, g, b) > 195 }, false)
+            if (kind.isEmpty() && penWhiteRe.containsMatchIn(white.uppercase())) kind = "pen"
+        }
+        crop.recycle()
+
+        val shown = "[" + navy.trim().replace('\n', ' ') + "] [" +
+            white.trim().replace('\n', '|') + "]"
+        if (shown.take(160) != dbgBanner) {
+            dbgBanner = shown.take(160)
+            refreshNote()
         }
 
-        var kind = ""
-        var idx = -1
-        for ((i, l) in lines.withIndex()) {
-            val u = l.uppercase()
-            if (goalRe.containsMatchIn(u)) { kind = "goal"; idx = i; break }
-            if (penRe.containsMatchIn(u)) { kind = "pen"; idx = i; break }
+        if (kind.isEmpty()) {
+            if (++evMiss >= 2) resetEvent()
+            return
         }
-        if (idx < 0) { lastKind = ""; seen = 0; return }
+        evMiss = 0
+        if (kind != evKind) { resetEvent(); evKind = kind }
+        evSeen++
+        if (white.isNotEmpty()) parseWhite(white)
 
-        if (kind == lastKind) seen++ else { lastKind = kind; seen = 1 }
         val now = SystemClock.elapsedRealtime()
-        if (seen >= 2 && now - spokenAt > Cfg.COOLDOWN_MS) {
+        if ((evName.isNotEmpty() && evSeen >= 3 || evSeen >= 5) && now - spokenAt > Cfg.COOLDOWN_MS) {
             spokenAt = now
-            val l1 = lines.getOrNull(idx + 1) ?: ""
-            val l2 = lines.getOrNull(idx + 2) ?: ""
-            speak(Commentary.make(kind, l1, l2))
+            speak(Commentary.make(evKind, evName, if (evKind == "goal") evAssist else evReason))
+        }
+    }
+
+    private fun parseWhite(white: String) {
+        val lines = white.lines().map { it.trim() }.filter { it.length > 2 }
+        val names = ArrayList<String>()
+        for (l in lines) {
+            val c = l.replace(Regex("[^A-Za-z#0-9 ]"), " ").replace(Regex("\\s+"), " ").trim()
+            if (!nameRe.containsMatchIn(c)) continue
+            val n = c.replace(Regex("^[#0-9 ]+"), "").replace(Regex("^[^A-Z]+"), "").trim()
+            if (n.length < 4) continue
+            names.add(n)
+            val sc = (if (goodNameRe.matches(n)) 100 else 0) + n.length
+            if (sc > evScore) { evScore = sc; evName = n }
+        }
+        for (l in lines) {
+            val u = l.uppercase()
+            if (u.contains("АССИ") || u.contains("БЕЗ ")) evAssist = "Без ассистентов"
+            if (penWhiteRe.containsMatchIn(u)) {
+                evReason = l.split(Regex("[-–—]"), limit = 2).getOrElse(1) { "" }.trim()
+            }
+        }
+        if (evKind == "goal" && evAssist.isEmpty()) {
+            val others = names.filter { it != evName && goodNameRe.matches(it) }
+            if (others.isNotEmpty()) evAssist = others.joinToString(", ")
         }
     }
 
@@ -265,35 +347,48 @@ class CaptureService : Service(), TextToSpeech.OnInitListener {
         'А' to 'A', 'В' to 'B', 'С' to 'C', 'Е' to 'E', 'К' to 'K', 'М' to 'M',
         'Н' to 'H', 'О' to 'O', 'Р' to 'P', 'Т' to 'T', 'Х' to 'X'
     )
+    private val digitFix = mapOf('6' to 'C', '5' to 'S', '0' to 'O', '8' to 'B', '1' to 'I')
     private val periodRe = Regex("([1-4])\\s*[-–—~]\\s*[ЙИNH]")
-    private val teamRe = Regex("[A-ZА-Я]{3}")
+    private var knownPair = ""
 
-    private fun analyzeBoard(bmp: Bitmap) {
-        val t = tess ?: return
-        t.setImage(bmp)
-        val text = (t.getUTF8Text() ?: "").uppercase()
-        bmp.recycle()
+    private fun analyzeBoard(board: Bitmap) {
+        val w = board.width
+        val h = board.height
+        val txt = ocr(
+            mask(board, 2) { r, g, b ->
+                minOf(r, g, b) > 185 || (r > 190 && g in 110..214 && b < 110)
+            }, true
+        ).uppercase()
+        val rx = (w * 0.72).toInt()
+        val right = Bitmap.createBitmap(board, rx, 0, w - rx, h)
+        board.recycle()
+        val per = ocr(mask(right, 3) { r, g, b -> r > 190 && g in 110..214 && b < 110 }, true).uppercase()
+        right.recycle()
 
-        val teams = teamRe.findAll(text)
-            .map { m -> m.value.map { lookalike[it] ?: it }.joinToString("") }
+        val shown = "[" + txt.trim() + "] [" + per.trim() + "]"
+        if (shown != dbgBoard) { dbgBoard = shown; refreshNote() }
+
+        val teams = Regex("[A-ZА-Я0-9]{3}").findAll(txt)
+            .filter { m -> m.value.any { it in 'A'..'Z' || it in 'А'..'Я' } }
+            .map { m -> m.value.map { lookalike[it] ?: it }.map { digitFix[it] ?: it }.joinToString("") }
             .filter { it != "MPH" && it.all { c -> c in 'A'..'Z' } }
             .toList()
-        val period = periodRe.find(text)?.groupValues?.get(1)?.toInt() ?: return
-        if (teams.size < 2) return
-        val pair = teams[0] + "-" + teams[1]
+        if (teams.size >= 2) knownPair = teams[0] + "-" + teams[1]
 
-        if (period == candPeriod && pair == candTeams) candSeen++
-        else { candPeriod = period; candTeams = pair; candSeen = 1 }
+        val period = periodRe.find(per)?.groupValues?.get(1)?.toIntOrNull()
+            ?: periodRe.find(txt)?.groupValues?.get(1)?.toIntOrNull()
+            ?: return
+
+        if (period == candPeriod) candSeen++ else { candPeriod = period; candSeen = 1 }
         if (candSeen < 2 || period == lastPeriod) return
 
-        val newGame = lastPeriod == 0 || (period == 1 && lastPeriod >= 3) || pair != spokenTeams
-        if (newGame && period == 1) {
-            spokenTeams = pair
+        val a = knownPair.substringBefore("-", "").ifEmpty { null }
+        val b = knownPair.substringAfter("-", "").ifEmpty { null }
+        if (period == 1 && (lastPeriod == 0 || lastPeriod >= 3)) {
             lastPeriod = 1
-            speak(Commentary.opening(teams[0], teams[1]))
+            speak(Commentary.opening(a, b))
         } else if (lastPeriod == 0) {
             lastPeriod = period // зашли в середину матча, молча запоминаем период
-            spokenTeams = pair
         } else if (period == lastPeriod + 1) {
             lastPeriod = period
             speak(Commentary.periodStart(period))
@@ -470,8 +565,10 @@ object Commentary {
 
     fun teamName(abbr: String) = teams[abbr] ?: abbr.lowercase().toList().joinToString(" ")
 
-    fun opening(a: String, b: String): String =
-        "Добрый вечер! Сегодня играют ${teamName(a)} и ${teamName(b)}. Начинается первый период!"
+    fun opening(a: String?, b: String?): String =
+        if (a != null && b != null)
+            "Добрый вечер! Сегодня играют ${teamName(a)} и ${teamName(b)}. Начинается первый период!"
+        else "Добрый вечер! Начинается первый период!"
 
     fun periodStart(p: Int): String {
         val n = when (p) { 2 -> "второй"; 3 -> "третий"; 4 -> "четвёртый"; else -> "$p-й" }
