@@ -26,6 +26,7 @@ import android.os.SystemClock
 import android.speech.tts.TextToSpeech
 import android.view.Gravity
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -69,14 +70,18 @@ class MainActivity : Activity() {
         }
         val prefs = getSharedPreferences("cfg", Context.MODE_PRIVATE)
         val keyEdit = EditText(this).apply {
-            hint = "Ключ ElevenLabs (необязательно)"
+            hint = "Ключ ElevenLabs или Fish Audio (необязательно)"
             setText(prefs.getString("key", ""))
             setSingleLine()
         }
         val voiceEdit = EditText(this).apply {
-            hint = "ID голоса ElevenLabs (необязательно)"
+            hint = "ID голоса (необязательно)"
             setText(prefs.getString("voice", ""))
             setSingleLine()
+        }
+        val fishBox = CheckBox(this).apply {
+            text = "Использовать Fish Audio (вместо ElevenLabs)"
+            isChecked = prefs.getBoolean("fish", false)
         }
         val start = Button(this).apply { text = "Старт комментатора" }
         val stop = Button(this).apply { text = "Стоп" }
@@ -88,6 +93,7 @@ class MainActivity : Activity() {
                 addView(info)
                 addView(keyEdit)
                 addView(voiceEdit)
+                addView(fishBox)
                 addView(start)
                 addView(stop)
             })
@@ -99,6 +105,7 @@ class MainActivity : Activity() {
             prefs.edit()
                 .putString("key", keyEdit.text.toString().trim())
                 .putString("voice", voiceEdit.text.toString().trim())
+                .putBoolean("fish", fishBox.isChecked)
                 .apply()
             val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             startActivityForResult(mpm.createScreenCaptureIntent(), req)
@@ -298,6 +305,7 @@ class CaptureService : Service(), TextToSpeech.OnInitListener {
     private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
     private val apiKey get() = prefs.getString("key", "")?.trim().orEmpty()
     private val voiceId get() = prefs.getString("voice", "")?.trim().orEmpty()
+    private val useFish get() = prefs.getBoolean("fish", false)
     private val elevenOn get() = apiKey.isNotEmpty() && voiceId.isNotEmpty()
     private val audioExec = Executors.newSingleThreadExecutor()
 
@@ -307,7 +315,7 @@ class CaptureService : Service(), TextToSpeech.OnInitListener {
                 try {
                     playEleven(s)
                 } catch (e: Exception) {
-                    showNotification("ElevenLabs не сработал: ${e.message}. Говорю голосом телефона")
+                    showNotification("Онлайн-голос не сработал: ${e.message}. Говорю голосом телефона")
                     if (ttsOk) tts?.speak(s, TextToSpeech.QUEUE_ADD, null, "u")
                 }
             }
@@ -317,16 +325,25 @@ class CaptureService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun playEleven(text: String) {
-        val conn = URL("https://api.elevenlabs.io/v1/text-to-speech/$voiceId")
-            .openConnection() as HttpURLConnection
+        val url = if (useFish) "https://api.fish.audio/v1/tts"
+        else "https://api.elevenlabs.io/v1/text-to-speech/$voiceId"
+        val conn = URL(url).openConnection() as HttpURLConnection
         conn.requestMethod = "POST"
         conn.connectTimeout = 10000
         conn.readTimeout = 20000
-        conn.setRequestProperty("xi-api-key", apiKey)
         conn.setRequestProperty("Content-Type", "application/json")
         conn.setRequestProperty("Accept", "audio/mpeg")
         conn.doOutput = true
-        val body = JSONObject().put("text", text).put("model_id", "eleven_multilingual_v2").toString()
+        val body: String
+        if (useFish) {
+            conn.setRequestProperty("Authorization", "Bearer $apiKey")
+            conn.setRequestProperty("model", "s2.1-pro")
+            body = JSONObject().put("text", text).put("reference_id", voiceId)
+                .put("format", "mp3").put("latency", "balanced").toString()
+        } else {
+            conn.setRequestProperty("xi-api-key", apiKey)
+            body = JSONObject().put("text", text).put("model_id", "eleven_multilingual_v2").toString()
+        }
         conn.outputStream.use { it.write(body.toByteArray()) }
         if (conn.responseCode != 200) {
             val err = conn.errorStream?.bufferedReader()?.readText()?.take(120) ?: ""
