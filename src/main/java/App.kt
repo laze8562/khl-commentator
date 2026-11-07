@@ -12,7 +12,9 @@ import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.AudioAttributes
 import android.media.ImageReader
+import android.media.MediaPlayer
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -24,11 +26,19 @@ import android.os.SystemClock
 import android.speech.tts.TextToSpeech
 import android.view.Gravity
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import com.googlecode.tesseract.android.TessBaseAPI
+import org.json.JSONObject
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 // ---------------------------------------------------------------
 // Настройки: какая часть экрана читается (доли от ширины/высоты).
@@ -57,19 +67,39 @@ class MainActivity : Activity() {
             textSize = 16f
             setPadding(48, 32, 48, 32)
         }
+        val prefs = getSharedPreferences("cfg", Context.MODE_PRIVATE)
+        val keyEdit = EditText(this).apply {
+            hint = "Ключ ElevenLabs (необязательно)"
+            setText(prefs.getString("key", ""))
+            setSingleLine()
+        }
+        val voiceEdit = EditText(this).apply {
+            hint = "ID голоса ElevenLabs (необязательно)"
+            setText(prefs.getString("voice", ""))
+            setSingleLine()
+        }
         val start = Button(this).apply { text = "Старт комментатора" }
         val stop = Button(this).apply { text = "Стоп" }
-        setContentView(LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            addView(info)
-            addView(start)
-            addView(stop)
+        setContentView(ScrollView(this).apply {
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(32, 16, 32, 16)
+                addView(info)
+                addView(keyEdit)
+                addView(voiceEdit)
+                addView(start)
+                addView(stop)
+            })
         })
         if (Build.VERSION.SDK_INT >= 33) {
             requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
         }
         start.setOnClickListener {
+            prefs.edit()
+                .putString("key", keyEdit.text.toString().trim())
+                .putString("voice", voiceEdit.text.toString().trim())
+                .apply()
             val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             startActivityForResult(mpm.createScreenCaptureIntent(), req)
         }
@@ -140,6 +170,7 @@ class CaptureService : Service(), TextToSpeech.OnInitListener {
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, handler
         )
         r.setOnImageAvailableListener({ onFrame(it) }, handler)
+        if (elevenOn) speak("Комментатор на связи")
         return START_NOT_STICKY
     }
 
@@ -262,16 +293,84 @@ class CaptureService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
+    // Озвучка: если в приложении введены ключ и ID голоса ElevenLabs, говорит он,
+    // иначе (или при ошибке сети) обычный голос Android.
+    private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
+    private val apiKey get() = prefs.getString("key", "")?.trim().orEmpty()
+    private val voiceId get() = prefs.getString("voice", "")?.trim().orEmpty()
+    private val elevenOn get() = apiKey.isNotEmpty() && voiceId.isNotEmpty()
+    private val audioExec = Executors.newSingleThreadExecutor()
+
     private fun speak(s: String) {
-        if (ttsOk) tts?.speak(s, TextToSpeech.QUEUE_ADD, null, "u")
+        if (elevenOn) {
+            audioExec.execute {
+                try {
+                    playEleven(s)
+                } catch (e: Exception) {
+                    showNotification("ElevenLabs не сработал: ${e.message}. Говорю голосом телефона")
+                    if (ttsOk) tts?.speak(s, TextToSpeech.QUEUE_ADD, null, "u")
+                }
+            }
+        } else if (ttsOk) {
+            tts?.speak(s, TextToSpeech.QUEUE_ADD, null, "u")
+        }
+    }
+
+    private fun playEleven(text: String) {
+        val conn = URL("https://api.elevenlabs.io/v1/text-to-speech/$voiceId")
+            .openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.connectTimeout = 10000
+        conn.readTimeout = 20000
+        conn.setRequestProperty("xi-api-key", apiKey)
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.setRequestProperty("Accept", "audio/mpeg")
+        conn.doOutput = true
+        val body = JSONObject().put("text", text).put("model_id", "eleven_multilingual_v2").toString()
+        conn.outputStream.use { it.write(body.toByteArray()) }
+        if (conn.responseCode != 200) {
+            val err = conn.errorStream?.bufferedReader()?.readText()?.take(120) ?: ""
+            throw RuntimeException("код ${conn.responseCode} $err")
+        }
+        val f = File(cacheDir, "v${System.nanoTime()}.mp3")
+        conn.inputStream.use { i -> f.outputStream().use { i.copyTo(it) } }
+        val latch = CountDownLatch(1)
+        val mp = MediaPlayer()
+        try {
+            mp.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
+            )
+            mp.setDataSource(f.absolutePath)
+            mp.setOnCompletionListener { latch.countDown() }
+            mp.setOnErrorListener { _, _, _ -> latch.countDown(); true }
+            mp.prepare()
+            mp.start()
+            latch.await(30, TimeUnit.SECONDS)
+        } finally {
+            mp.release()
+            f.delete()
+        }
     }
 
     override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            tts?.language = Locale("ru", "RU")
-            ttsOk = true
-            speak("Комментатор на связи")
+        if (status != TextToSpeech.SUCCESS) {
+            showNotification("Ошибка: синтез речи Android не запустился (код $status)")
+            return
         }
+        val t = tts ?: return
+        t.setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
+        )
+        val r = t.setLanguage(Locale("ru", "RU"))
+        if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+            showNotification("На телефоне нет русского голоса: обнови «Синтез речи Google» и скачай русский язык")
+        }
+        ttsOk = true
+        if (!elevenOn) speak("Комментатор на связи")
     }
 
     private fun showNotification(text: String, first: Boolean = false) {
@@ -302,6 +401,7 @@ class CaptureService : Service(), TextToSpeech.OnInitListener {
         reader?.close()
         projection?.stop()
         tts?.shutdown()
+        audioExec.shutdownNow()
         handler.post { tess?.recycle() }
         ht.quitSafely()
         super.onDestroy()
