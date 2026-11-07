@@ -193,7 +193,7 @@ class CaptureService : Service(), TextToSpeech.OnInitListener {
     private fun analyze(bmp: Bitmap) {
         val t = tess ?: return
         t.setImage(bmp)
-        val text = t.utf8Text ?: ""
+        val text = t.getUTF8Text() ?: ""
         bmp.recycle()
         val lines = text.lines().map { it.trim() }.filter { it.length > 1 }
 
@@ -233,7 +233,7 @@ class CaptureService : Service(), TextToSpeech.OnInitListener {
     private fun analyzeBoard(bmp: Bitmap) {
         val t = tess ?: return
         t.setImage(bmp)
-        val text = (t.utf8Text ?: "").uppercase()
+        val text = (t.getUTF8Text() ?: "").uppercase()
         bmp.recycle()
 
         val teams = teamRe.findAll(text)
